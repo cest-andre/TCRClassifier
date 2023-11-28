@@ -75,7 +75,6 @@ class FocalLoss(nn.Module):
 # loss function to be used for classification training
 clf_loss_func = FocalLoss(gamma=3, alpha=0.25, no_agg=True)    
 
-
 class TCRModel(BertModel):
     def __init__(self):
         super().__init__(BERT_CONFIG)  # Transformer
