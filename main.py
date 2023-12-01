@@ -82,11 +82,11 @@ class Classifier():
 
         self.model = TCRModel()#.to(device)
         self.model.to(device)
-        # self.cos = nn.CosineSimilarity(dim=2)
+        self.cos = nn.CosineSimilarity(dim=2)
         # self.pretrain_loss = nn.BCELoss().to(device)
 
-        # self.loss_func = clf_loss_func.to(device)
-        # self.optimizer = optim.RAdam(self.model.parameters(), lr=self.learning_rate)
+        self.loss_func = clf_loss_func.to(device)
+        self.optimizer = optim.RAdam(self.model.parameters(), lr=self.learning_rate)
 
     def save(self, filename):
         self.model.save(filename)
@@ -128,15 +128,13 @@ class Classifier():
         # Compute the loss
         loss = self.contrastive_loss(base_embed[:, 0, :], aug_embed[:, 0, :])
 
-        #   NOTE:  why is this ones_like here?
-        # grad_output = torch.ones_like(loss)  
-        
         # Backpropagation and optimization
         # self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
         return loss
+    
 
     def train_classifier(self, x):
         '''
@@ -146,6 +144,7 @@ class Classifier():
         '''
         X, y = x
         X, y = X.to(device), y.to(device)
+
         mask = torch.where(X != 0, torch.tensor(1), torch.tensor(0))
 
         self.optimizer.zero_grad()
@@ -154,16 +153,14 @@ class Classifier():
 
         # Compute the loss
         loss = self.loss_func(output, y)
-        loss = loss.mean()
-        # grad_output = torch.ones_like(loss)  
-        
+        loss = torch.mean(loss)
+
         # Backpropagation and optimization
-        # self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
-        return loss
-
+        return loss.item()
+    
     
     def eval_classifier(self, x):
         X, y = x
@@ -181,6 +178,7 @@ class Classifier():
 
 if __name__ == "__main__":
 
+    pre_train = False
     epoch = 16
     bsz = 256
 
@@ -189,24 +187,64 @@ if __name__ == "__main__":
     data, labels = process_data("./data.csv")
 
     dataset = TensorDataset(data, labels)
-    
-    #   TODO:  Split three ways and perform 3-fold cross-validation (train on 2, test on 1).
-    # Define the sizes of the training and testing sets
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+    data_loader = DataLoader(dataset, shuffle=True, batch_size=bsz)
 
-    train_loader = DataLoader(train_dataset, shuffle=True, batch_size=bsz)
-    test_loader = DataLoader(test_dataset, shuffle=False, batch_size=bsz)
-    
     print("Processing complete")
 
     classifier = Classifier()
+    classifier.model.train()
+
+    if pre_train:
+        
+        print("Pre-training...")
+
+        for i in tqdm(range(epoch)):
+            pre_train_loss = 0
+
+            for batch_ndx, sample in enumerate(tqdm(data_loader, leave=False)):
+                pre_train_loss += classifier.pretrain(sample)
+
+            print(f"Epoch loss (pre-training): {pre_train_loss / batch_ndx+1}")
+        
+
+    # k-fold cross validation
+    # The model is trained and evaluated k times, each time using a different fold as the test set and the remaining folds as the training set.
+    k = 3 # Number of folds
+    total_size = len(dataset)
+    fold_sizes = [total_size // k, total_size // k, total_size - ((k-1) * (total_size // 3))]
+
+    fold_datasets = random_split(dataset, fold_sizes)
+
+    for fold_idx, test_fold in enumerate(fold_datasets):
+        train_folds = [fold_datasets[i] for i in range(k) if i != fold_idx]
+        train_dataset = torch.utils.data.ConcatDataset(train_folds)
+
+        train_loader = DataLoader(train_dataset, shuffle=True, batch_size=bsz)
+        test_loader = DataLoader(test_fold, shuffle=False, batch_size=bsz)
+
+        print("Training classifier...")
+
+        for i in tqdm(range(epoch)):
+            loss = 0
+
+            for batch_ndx, sample in enumerate(tqdm(train_loader, leave=False)):
+                loss += classifier.train_classifier(sample)
+
+            print(f"Epoch loss: {loss / batch_ndx+1}")
+
+        classifier.model.eval()
+        perc_correct = []
+
+
+        print("Evaluate classification...")
+        
+        for batch_ndx, sample in enumerate(tqdm(test_loader, leave=False)):
+            perc_correct.append(classifier.eval_classifier(sample))
+            
+        print(f"Percent Correct: {torch.mean(torch.tensor(perc_correct))}")
 
     # print("Pretraining...")
     # loss = 0
-
-    classifier.model.train()
     
     # for i in tqdm(range(epoch)):
     #     for batch_ndx, sample in enumerate(tqdm(train_loader, leave=False)):
@@ -214,44 +252,37 @@ if __name__ == "__main__":
         
     #     print(f"Loss per epoch: {loss / i+1}")
 
-    print("Fine tuning with classification training...")
+    # print("Fine tuning with classification training...")
 
-    loss_func = clf_loss_func.to(device)
-    optimizer = optim.RAdam(classifier.model.parameters(), lr=0.001)
+    # loss_func = clf_loss_func.to(device)
+    # optimizer = optim.RAdam(classifier.model.parameters(), lr=0.001)
     
-    for i in tqdm(range(epoch)):
-        loss = 0
+    # for i in tqdm(range(epoch)):
+    #     loss = 0
 
-        for batch_ndx, sample in enumerate(tqdm(train_loader, leave=False)):
+    #     for batch_ndx, sample in enumerate(tqdm(train_loader, leave=False)):
 
-            # loss += classifier.train_classifier(sample)
+    #         # loss += classifier.train_classifier(sample)
 
-            X, y = sample
-            X, y = X.to(device), y.to(device)
-            mask = torch.where(X != 0, torch.tensor(1), torch.tensor(0))
+    #         X, y = sample
+    #         X, y = X.to(device), y.to(device)
+    #         mask = torch.where(X != 0, torch.tensor(1), torch.tensor(0))
 
-            optimizer.zero_grad()
+    #         optimizer.zero_grad()
 
-            output = classifier.model(X, mask)
+    #         output = classifier.model(X, mask)
 
-            # Compute the loss
-            loss = loss_func(output, y).mean()
-            # loss = loss.mean()
-            # grad_output = torch.ones_like(loss)  
+    #         # Compute the loss
+    #         loss = loss_func(output, y).mean()
+    #         # loss = loss.mean()
+    #         # grad_output = torch.ones_like(loss)  
             
-            # Backpropagation and optimization
-            # self.optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+    #         # Backpropagation and optimization
+    #         # self.optimizer.zero_grad()
+    #         loss.backward()
+    #         optimizer.step()
         
-        print(f"Epoch loss: {loss / batch_ndx+1}")
+    #     print(f"Epoch loss: {loss / batch_ndx+1}")
 
-    classifier.model.eval()
-    perc_correct = []
-
-    print("Evaluate classification...")
-    for batch_ndx, sample in enumerate(tqdm(test_loader, leave=False)):
-        perc_correct.append(classifier.eval_classifier(sample))
-        
-    print(f"Percent Correct: {torch.mean(torch.tensor(perc_correct))}")
+    
     
