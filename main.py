@@ -1,8 +1,9 @@
 import torch
+import torch.nn.functional as F 
 from torch import nn, optim
-from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.data import DataLoader, TensorDataset, Subset, random_split
 
-from model import TCRModel, clf_loss_func
+from model import TCRModel, clf_loss_func, BERT_CONFIG
 
 import torchdata.datapipes as dp
 import torchtext.transforms as T
@@ -11,6 +12,8 @@ from torchtext.vocab import build_vocab_from_iterator
 from tqdm import tqdm
 
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+# START -- Data processing functions
 
 def tokenize(text):
     """
@@ -72,68 +75,134 @@ def process_data(file_path):
     antigens, TCRs, interactions = zip(*data_pipe)
     antigens, TCRs, labels = applyPadding(antigens), applyPadding(TCRs), applyPadding(interactions)
     
-    data = torch.concat((antigens, TCRs), 1)
-    return data, labels
+    return antigens, TCRs, labels
+
+# END -- Data processing functions
+
+
+# START -- Contrastive learning
+
+def device_as(t1, t2):
+   """
+   Moves t1 to the device of t2
+   """
+   return t1.to(t2.device)
+
+class ContrastiveLoss(nn.Module):
+   """
+   Vanilla Contrastive loss, also called InfoNceLoss as in SimCLR paper
+   """
+   def __init__(self, batch_size, temperature=0.5):
+       super().__init__()
+       self.batch_size = batch_size
+       self.temperature = temperature
+       self.mask = (~torch.eye(batch_size * 2, batch_size * 2, dtype=bool)).float()
+
+
+   def calc_similarity_batch(self, a, b):
+       representations = torch.cat([a, b], dim=0)
+       return F.cosine_similarity(representations.unsqueeze(1), representations.unsqueeze(0), dim=2)
+
+
+   def forward(self, proj_1, proj_2):
+       """
+       proj_1 and proj_2 are batched embeddings [batch, embedding_dim]
+       where corresponding indices are pairs
+       z_i, z_j in the SimCLR paper
+       """
+       batch_size = proj_1.shape[0]
+       z_i = F.normalize(proj_1, p=2, dim=1)
+       z_j = F.normalize(proj_2, p=2, dim=1)
+
+       similarity_matrix = self.calc_similarity_batch(z_i, z_j)
+
+       sim_ij = torch.diag(similarity_matrix, batch_size)
+       sim_ji = torch.diag(similarity_matrix, -batch_size)
+
+       positives = torch.cat([sim_ij, sim_ji], dim=0)
+
+       nominator = torch.exp(positives / self.temperature)
+
+       denominator = device_as(self.mask, similarity_matrix) * torch.exp(similarity_matrix / self.temperature)
+
+       all_losses = -torch.log(nominator / torch.sum(denominator, dim=1))
+       loss = torch.sum(all_losses) / (2 * self.batch_size)
+       return loss
+      
+# END -- Contrastive learning
+
+
+class ClassifierModel(nn.Module):
+
+    def __init__(self, mlp_dim=3):
+        super(ClassifierModel, self).__init__()
+        self.classifier = TCRModel()
+        self.mlp = nn.Linear(BERT_CONFIG.hidden_size, mlp_dim)
+
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor = None,
+        classification: bool = True
+    ):
+        output = self.classifier(input_ids, attention_mask, classification)
+        
+        # Is this a good idea?
+        if not classification:
+            output = self.mlp(output)
+            output = torch.sum(output, 2)
+
+        return output
 
 
 class Classifier():
-    def __init__(self):
+    def __init__(self, bsz):
         self.learning_rate = 0.001
 
-        self.model = TCRModel()#.to(device)
+        self.model = ClassifierModel()
         self.model.to(device)
-        self.cos = nn.CosineSimilarity(dim=2)
-        # self.pretrain_loss = nn.BCELoss().to(device)
 
         self.loss_func = clf_loss_func.to(device)
-        self.optimizer = optim.RAdam(self.model.parameters(), lr=self.learning_rate)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+
+        self.pretrain_loss_func = ContrastiveLoss(bsz)
+        self.pretrain_optimizer = optim.SGD(self.model.parameters(), lr=self.learning_rate)
+
 
     def save(self, filename):
         self.model.save(filename)
 
+
     def load(self, filename):
         self.model.load(filename)
 
-    
-    #   TODO:  Use broadcasting to construct a batch_size x batch_size matrix of cosine similarities.
-    #   Loss should take difference of this sim matrix with identity matrix (1s along diag zeros elsewhere).
-    #
-    #   What should final vector be?  Last state contains an embedding for each token.  Do I take the mean?
-    def contrastive_loss(self, base_embed, aug_embed):
-        base_embed = torch.broadcast_to(base_embed, (base_embed.shape[0], base_embed.shape[0], base_embed.shape[1]))
-        aug_embed = torch.broadcast_to(aug_embed, (aug_embed.shape[0], aug_embed.shape[0], aug_embed.shape[1]))
 
-        sims = self.cos(base_embed, torch.transpose(aug_embed, 0, 1))
-        loss = self.pretrain_loss(nn.Sigmoid()(sims), torch.eye(sims.shape[0]).to(device))
+    def pretrain(self, x):
+        
+        X1, X2, _ = x
 
-        return loss
+        base_X = torch.concat((X1,X2), 1)
+        aug_X = torch.concat((X2,X1), 1)
+        
+        base_X = base_X.to(device)
+        aug_X = aug_X.to(device)
 
-
-    def pretrain(self, x, permute_num=8):
-        base_x, _ = x
-        base_x = base_x.to(device)
-        aug_x = torch.clone(base_x)#.to(device)
+        base_mask = torch.where(base_X != 0, torch.tensor(1), torch.tensor(0))
+        aug_mask = torch.where(aug_X != 0, torch.tensor(1), torch.tensor(0))
 
         self.optimizer.zero_grad()
 
-        for i in range(base_x.shape[0]):
-            valid_tokens = torch.nonzero(torch.logical_and(torch.logical_and(base_x[i] != 0, base_x[i] != 1), base_x[i] != 2), as_tuple=True)
-            aug_x[i, valid_tokens[0][torch.randperm(valid_tokens[0].shape[0])[:permute_num]]] = aug_x[i, valid_tokens[0][torch.randperm(valid_tokens[0].shape[0])[:permute_num]]]
+        base_output = self.model(base_X, base_mask, classification=False)
+        aug_output = self.model(aug_X, aug_mask, classification=False)
 
-        mask = torch.where(base_x != 0, torch.tensor(1), torch.tensor(0))
-
-        base_embed = self.model(base_x, mask, classification=False)
-        aug_embed = self.model(aug_x, mask, classification=False)
-
-        # Compute the loss
-        loss = self.contrastive_loss(base_embed[:, 0, :], aug_embed[:, 0, :])
+        loss = self.pretrain_loss_func(base_output, aug_output)
 
         # Backpropagation and optimization
-        # self.optimizer.zero_grad()
         loss.backward()
-        self.optimizer.step()
+        self.pretrain_optimizer.step()
 
-        return loss
+        return loss.item()
     
 
     def train_classifier(self, x):
@@ -142,7 +211,8 @@ class Classifier():
         :param x: train data
         :return: (mean) loss of the model on the batch
         '''
-        X, y = x
+        X1, X2, y = x
+        X = torch.concat((X1,X2), 1)
         X, y = X.to(device), y.to(device)
 
         mask = torch.where(X != 0, torch.tensor(1), torch.tensor(0))
@@ -153,7 +223,7 @@ class Classifier():
 
         # Compute the loss
         loss = self.loss_func(output, y)
-        loss = torch.mean(loss)
+        loss = loss.mean()
 
         # Backpropagation and optimization
         loss.backward()
@@ -163,7 +233,8 @@ class Classifier():
     
     
     def eval_classifier(self, x):
-        X, y = x
+        X1, X2, y = x
+        X = torch.concat((X1,X2), 1)
         X, y = X.to(device), y.to(device)
         mask = torch.where(X != 0, torch.tensor(1), torch.tensor(0))
 
@@ -178,20 +249,23 @@ class Classifier():
 
 if __name__ == "__main__":
 
-    pre_train = False
+    pre_train = True
     epoch = 16
     bsz = 256
 
     print("Processing data...")
     
-    data, labels = process_data("./data.csv")
+    anitgens, TCRs, labels = process_data("./data.csv")
 
-    dataset = TensorDataset(data, labels)
-    data_loader = DataLoader(dataset, shuffle=True, batch_size=bsz)
+    dataset = TensorDataset(anitgens, TCRs, labels)
+    indices = [i for i, label in enumerate(labels) if label == 1]
+    
+    subset = Subset(dataset, indices)
+    subset_data_loader = DataLoader(subset, shuffle=True, batch_size=bsz)
 
     print("Processing complete")
 
-    classifier = Classifier()
+    classifier = Classifier(bsz)
     classifier.model.train()
 
     if pre_train:
@@ -201,7 +275,7 @@ if __name__ == "__main__":
         for i in tqdm(range(epoch)):
             pre_train_loss = 0
 
-            for batch_ndx, sample in enumerate(tqdm(data_loader, leave=False)):
+            for batch_ndx, sample in enumerate(tqdm(subset_data_loader, leave=False)):
                 pre_train_loss += classifier.pretrain(sample)
 
             print(f"Epoch loss (pre-training): {pre_train_loss / batch_ndx+1}")
@@ -242,47 +316,5 @@ if __name__ == "__main__":
             perc_correct.append(classifier.eval_classifier(sample))
             
         print(f"Percent Correct: {torch.mean(torch.tensor(perc_correct))}")
-
-    # print("Pretraining...")
-    # loss = 0
-    
-    # for i in tqdm(range(epoch)):
-    #     for batch_ndx, sample in enumerate(tqdm(train_loader, leave=False)):
-    #         loss += classifier.pretrain(sample)
-        
-    #     print(f"Loss per epoch: {loss / i+1}")
-
-    # print("Fine tuning with classification training...")
-
-    # loss_func = clf_loss_func.to(device)
-    # optimizer = optim.RAdam(classifier.model.parameters(), lr=0.001)
-    
-    # for i in tqdm(range(epoch)):
-    #     loss = 0
-
-    #     for batch_ndx, sample in enumerate(tqdm(train_loader, leave=False)):
-
-    #         # loss += classifier.train_classifier(sample)
-
-    #         X, y = sample
-    #         X, y = X.to(device), y.to(device)
-    #         mask = torch.where(X != 0, torch.tensor(1), torch.tensor(0))
-
-    #         optimizer.zero_grad()
-
-    #         output = classifier.model(X, mask)
-
-    #         # Compute the loss
-    #         loss = loss_func(output, y).mean()
-    #         # loss = loss.mean()
-    #         # grad_output = torch.ones_like(loss)  
-            
-    #         # Backpropagation and optimization
-    #         # self.optimizer.zero_grad()
-    #         loss.backward()
-    #         optimizer.step()
-        
-    #     print(f"Epoch loss: {loss / batch_ndx+1}")
-
     
     
