@@ -145,31 +145,11 @@ class ContrastiveLoss(nn.Module):
 
 # END -- Contrastive learning
 
-class Model(nn.Module):
-    def __init__(self, mlp_dim):
-        super(Model, self).__init__()
-
-        self.classifier = TCRModel()
-        self.mlp = nn.Linear(BERT_CONFIG.hidden_size, mlp_dim)
-        self.relu = nn.ReLU()
-        self.output = nn.Linear(mlp_dim, mlp_dim)
-
-    def forward(self, X, mask, classification = True):
-        out = self.classifier(X, mask, classification)
-
-        if not classification:
-            out = out[:,0,:]
-            out = self.mlp(out)
-            out = self.relu(out)
-            out = self.output(out)
-
-        return out
-
 class Classifier():
     def __init__(self):
-        self.learning_rate = 1e-6
+        self.learning_rate = 1e-5
 
-        self.model = Model(128)
+        self.model = TCRModel()
         self.model.to(device)
 
         self.pretrain_loss_func = ContrastiveLoss(temperature=0.2)
@@ -217,8 +197,8 @@ class Classifier():
         proj_1_output = self.model(proj_1, proj_1_mask, classification=False)
         proj_2_output = self.model(proj_2, proj_2_mask, classification=False)
 
-        # proj_1_output = proj_1_output[:,0,:]
-        # proj_2_output = proj_2_output[:,0,:]
+        proj_1_output = proj_1_output[:,0,:]
+        proj_2_output = proj_2_output[:,0,:]
 
         loss = self.pretrain_loss_func(proj_1_output, proj_2_output)
 
