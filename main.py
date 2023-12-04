@@ -1,5 +1,5 @@
 import torch
-import torch.nn.functional as F 
+import torch.nn.functional as F
 from torch import nn, optim
 from torch.utils.data import DataLoader, TensorDataset, Subset, random_split
 
@@ -11,7 +11,7 @@ from torchtext.vocab import build_vocab_from_iterator
 
 from tqdm import tqdm
 
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # START -- Data processing functions
 
@@ -23,12 +23,12 @@ def tokenize(text):
 
 def getTokens(data_iter):
     """
-    Function to yield tokens from an iterator. 
+    Function to yield tokens from an iterator.
     """
     for antigen, TCR, _ in data_iter:
         yield tokenize(antigen) + tokenize(TCR)
 
-def getTransform(vocab, start_token):
+def antigenTransform(vocab, start_token):
     """
     Create transforms based on given vocabulary. The returned transform is applied to sequence
     of tokens.
@@ -36,8 +36,23 @@ def getTransform(vocab, start_token):
     text_tranform = T.Sequential(
         # Converts the sentences to indices based on given vocabulary
         T.VocabTransform(vocab=vocab),
-        # Add start_token at beginning. 
+        # Add start_token at the beginning.
         T.AddToken(start_token, begin=True),
+    )
+    return text_tranform
+
+def TCRTransform(vocab, start_token, end_token):
+    """
+    Create transforms based on given vocabulary. The returned transform is applied to sequence
+    of tokens.
+    """
+    text_tranform = T.Sequential(
+        # Converts the sentences to indices based on given vocabulary
+        T.VocabTransform(vocab=vocab),
+        # Add start_token at the beginning.
+        T.AddToken(start_token, begin=True),
+        # Add end_token at the end.
+        T.AddToken(end_token, begin=False),
     )
     return text_tranform
 
@@ -46,13 +61,12 @@ def applyTransform(sequence_pair, vocab):
     Apply transforms to sequence of tokens in a sequence pair
     """
     return (
-        getTransform(vocab, 1)(tokenize(sequence_pair[0])),
-        getTransform(vocab, 2)(tokenize(sequence_pair[1])),
+        antigenTransform(vocab, 1)(tokenize(sequence_pair[0])) + TCRTransform(vocab, 2, 2)(tokenize(sequence_pair[1])),
         int(sequence_pair[2])
     )
 
 def applyPadding(sequence):
-    return T.ToTensor(0)(list(sequence))
+    return T.ToTensor(0, dtype=torch.long)(list(sequence))
 
 '''
 :param file_path: path to csv file
@@ -66,16 +80,16 @@ def process_data(file_path):
 
     vocab = build_vocab_from_iterator(
         getTokens(data_pipe),
-        specials= ['<pad>', '<cls>', '<seq>', '<unk>'],
+        specials= ['<pad>', '<cls>', '<sep>', '<mask>', '<unk>'],
         special_first=True
     )
     vocab.set_default_index(vocab['<unk>'])
 
     data_pipe = data_pipe.map(lambda x: applyTransform(x, vocab))
-    antigens, TCRs, interactions = zip(*data_pipe)
-    antigens, TCRs, labels = applyPadding(antigens), applyPadding(TCRs), applyPadding(interactions)
-    
-    return antigens, TCRs, labels
+    input_ids, labels = zip(*data_pipe)
+    input_ids, labels = applyPadding(input_ids), applyPadding(labels)
+
+    return input_ids, labels
 
 # END -- Data processing functions
 
@@ -92,11 +106,9 @@ class ContrastiveLoss(nn.Module):
    """
    Vanilla Contrastive loss, also called InfoNceLoss as in SimCLR paper
    """
-   def __init__(self, batch_size, temperature=0.5):
+   def __init__(self, temperature=0.5):
        super().__init__()
-       self.batch_size = batch_size
        self.temperature = temperature
-       self.mask = (~torch.eye(batch_size * 2, batch_size * 2, dtype=bool)).float()
 
 
    def calc_similarity_batch(self, a, b):
@@ -123,51 +135,48 @@ class ContrastiveLoss(nn.Module):
 
        nominator = torch.exp(positives / self.temperature)
 
-       denominator = device_as(self.mask, similarity_matrix) * torch.exp(similarity_matrix / self.temperature)
+       mask = (~torch.eye(batch_size * 2, batch_size * 2, dtype=bool)).float()
+
+       denominator = device_as(mask, similarity_matrix) * torch.exp(similarity_matrix / self.temperature)
 
        all_losses = -torch.log(nominator / torch.sum(denominator, dim=1))
-       loss = torch.sum(all_losses) / (2 * self.batch_size)
+       loss = torch.sum(all_losses) / (2 * batch_size)
        return loss
-      
+
 # END -- Contrastive learning
 
+class Model(nn.Module):
+    def __init__(self, mlp_dim):
+        super(Model, self).__init__()
 
-class ClassifierModel(nn.Module):
-
-    def __init__(self, mlp_dim=3):
-        super(ClassifierModel, self).__init__()
         self.classifier = TCRModel()
         self.mlp = nn.Linear(BERT_CONFIG.hidden_size, mlp_dim)
+        self.relu = nn.ReLU()
+        self.output = nn.Linear(mlp_dim, mlp_dim)
 
+    def forward(self, X, mask, classification = True):
+        out = self.classifier(X, mask, classification)
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor = None,
-        classification: bool = True
-    ):
-        output = self.classifier(input_ids, attention_mask, classification)
-        
-        # Is this a good idea?
         if not classification:
-            output = self.mlp(output)
-            output = torch.sum(output, 2)
+            out = out[:,0,:]
+            out = self.mlp(out)
+            out = self.relu(out)
+            out = self.output(out)
 
-        return output
-
+        return out
 
 class Classifier():
-    def __init__(self, bsz):
-        self.learning_rate = 0.001
+    def __init__(self):
+        self.learning_rate = 1e-6
 
-        self.model = ClassifierModel()
+        self.model = Model(128)
         self.model.to(device)
 
-        self.loss_func = clf_loss_func.to(device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        self.pretrain_loss_func = ContrastiveLoss(temperature=0.2)
+        self.pretrain_optimizer = optim.Adam(self.model.parameters())
 
-        self.pretrain_loss_func = ContrastiveLoss(bsz)
-        self.pretrain_optimizer = optim.SGD(self.model.parameters(), lr=self.learning_rate)
+        self.loss_func = clf_loss_func.to(device)
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.learning_rate)
 
 
     def save(self, filename):
@@ -178,32 +187,47 @@ class Classifier():
         self.model.load(filename)
 
 
+    def augment(self, base_X, num_tokens_to_replace):
+        projection = torch.clone(base_X)
+
+        indices = (base_X > 2).nonzero()
+
+        for row_idx in range(projection.size(0)):
+            row_tokens = indices[indices[:, 0] == row_idx][:, 1]
+            if row_tokens.numel() > 0:
+                random_token_idx = row_tokens[torch.randint(0, row_tokens.numel(), (num_tokens_to_replace,))]
+                projection[row_idx, random_token_idx] = 3
+        
+        return projection
+
+
     def pretrain(self, x):
-        
-        X1, X2, _ = x
 
-        base_X = torch.concat((X1,X2), 1)
-        aug_X = torch.concat((X2,X1), 1)
-        
+        base_X, _ = x
         base_X = base_X.to(device)
-        aug_X = aug_X.to(device)
 
-        base_mask = torch.where(base_X != 0, torch.tensor(1), torch.tensor(0))
-        aug_mask = torch.where(aug_X != 0, torch.tensor(1), torch.tensor(0))
+        proj_1 = self.augment(base_X, num_tokens_to_replace=1)
+        proj_2 = self.augment(base_X, num_tokens_to_replace=1)
+
+        proj_1_mask = torch.where(proj_1 != 0, torch.tensor(1), torch.tensor(0))
+        proj_2_mask = torch.where(proj_2 != 0, torch.tensor(1), torch.tensor(0))
 
         self.optimizer.zero_grad()
 
-        base_output = self.model(base_X, base_mask, classification=False)
-        aug_output = self.model(aug_X, aug_mask, classification=False)
+        proj_1_output = self.model(proj_1, proj_1_mask, classification=False)
+        proj_2_output = self.model(proj_2, proj_2_mask, classification=False)
 
-        loss = self.pretrain_loss_func(base_output, aug_output)
+        # proj_1_output = proj_1_output[:,0,:]
+        # proj_2_output = proj_2_output[:,0,:]
+
+        loss = self.pretrain_loss_func(proj_1_output, proj_2_output)
 
         # Backpropagation and optimization
         loss.backward()
         self.pretrain_optimizer.step()
 
         return loss.item()
-    
+
 
     def train_classifier(self, x):
         '''
@@ -211,8 +235,7 @@ class Classifier():
         :param x: train data
         :return: (mean) loss of the model on the batch
         '''
-        X1, X2, y = x
-        X = torch.concat((X1,X2), 1)
+        X, y = x
         X, y = X.to(device), y.to(device)
 
         mask = torch.where(X != 0, torch.tensor(1), torch.tensor(0))
@@ -230,11 +253,10 @@ class Classifier():
         self.optimizer.step()
 
         return loss.item()
-    
-    
+
+
     def eval_classifier(self, x):
-        X1, X2, y = x
-        X = torch.concat((X1,X2), 1)
+        X, y = x
         X, y = X.to(device), y.to(device)
         mask = torch.where(X != 0, torch.tensor(1), torch.tensor(0))
 
@@ -250,36 +272,36 @@ class Classifier():
 if __name__ == "__main__":
 
     pre_train = True
-    epoch = 16
+    epoch = 40
     bsz = 256
 
     print("Processing data...")
-    
-    anitgens, TCRs, labels = process_data("./data.csv")
 
-    dataset = TensorDataset(anitgens, TCRs, labels)
-    indices = [i for i, label in enumerate(labels) if label == 1]
-    
-    subset = Subset(dataset, indices)
-    subset_data_loader = DataLoader(subset, shuffle=True, batch_size=bsz)
+    input_ids, labels = process_data("./data.csv")
+
+    dataset = TensorDataset(input_ids, labels)
+
+    data_loader = DataLoader(dataset, shuffle=True, batch_size=bsz)
 
     print("Processing complete")
 
-    classifier = Classifier(bsz)
+    classifier = Classifier()
     classifier.model.train()
 
     if pre_train:
-        
+
         print("Pre-training...")
 
         for i in tqdm(range(epoch)):
             pre_train_loss = 0
 
-            for batch_ndx, sample in enumerate(tqdm(subset_data_loader, leave=False)):
+            for batch_ndx, sample in enumerate(tqdm(data_loader, leave=False)):
                 pre_train_loss += classifier.pretrain(sample)
 
             print(f"Epoch loss (pre-training): {pre_train_loss / batch_ndx+1}")
-        
+
+    epoch = 3
+    bsz = 32
 
     # k-fold cross validation
     # The model is trained and evaluated k times, each time using a different fold as the test set and the remaining folds as the training set.
@@ -309,12 +331,10 @@ if __name__ == "__main__":
         classifier.model.eval()
         perc_correct = []
 
-
         print("Evaluate classification...")
-        
+
         for batch_ndx, sample in enumerate(tqdm(test_loader, leave=False)):
             perc_correct.append(classifier.eval_classifier(sample))
-            
+
         print(f"Percent Correct: {torch.mean(torch.tensor(perc_correct))}")
-    
-    
+
