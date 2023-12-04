@@ -106,9 +106,10 @@ class ContrastiveLoss(nn.Module):
    """
    Vanilla Contrastive loss, also called InfoNceLoss as in SimCLR paper
    """
-   def __init__(self, temperature=0.5):
+   def __init__(self, batch_size, temperature=0.5):
        super().__init__()
        self.temperature = temperature
+       self.batch_size = batch_size
 
 
    def calc_similarity_batch(self, a, b):
@@ -140,7 +141,7 @@ class ContrastiveLoss(nn.Module):
        denominator = device_as(mask, similarity_matrix) * torch.exp(similarity_matrix / self.temperature)
 
        all_losses = -torch.log(nominator / torch.sum(denominator, dim=1))
-       loss = torch.sum(all_losses) / (2 * batch_size)
+       loss = torch.sum(all_losses) / (2 * self.batch_size)
        return loss
 
 # END -- Contrastive learning
@@ -152,11 +153,13 @@ class Classifier():
         self.model = TCRModel()
         self.model.to(device)
 
-        self.pretrain_loss_func = ContrastiveLoss(temperature=0.2)
-        self.pretrain_optimizer = optim.Adam(self.model.parameters())
+        self.pretrain_loss_func = ContrastiveLoss(batch_size=1024, temperature=0.2)
+        self.pretrain_optimizer = optim.SGD(self.model.parameters(), lr=1e-3)
 
         self.loss_func = clf_loss_func.to(device)
         self.optimizer = optim.AdamW(self.model.parameters(), lr=self.learning_rate)
+
+        self.accum_iter = 16  
 
 
     def save(self, filename):
@@ -181,7 +184,7 @@ class Classifier():
         return projection
 
 
-    def pretrain(self, x):
+    def pretrain(self, batch_ndx, x, max):
 
         base_X, _ = x
         base_X = base_X.to(device)
@@ -192,7 +195,6 @@ class Classifier():
         proj_1_mask = torch.where(proj_1 != 0, torch.tensor(1), torch.tensor(0))
         proj_2_mask = torch.where(proj_2 != 0, torch.tensor(1), torch.tensor(0))
 
-        self.optimizer.zero_grad()
 
         proj_1_output = self.model(proj_1, proj_1_mask, classification=False)
         proj_2_output = self.model(proj_2, proj_2_mask, classification=False)
@@ -204,7 +206,10 @@ class Classifier():
 
         # Backpropagation and optimization
         loss.backward()
-        self.pretrain_optimizer.step()
+
+        if ((batch_ndx + 1) % self.accum_iter == 0) or (batch_ndx + 1 == max):
+            self.pretrain_optimizer.step()
+            self.optimizer.zero_grad()
 
         return loss.item()
 
@@ -251,9 +256,9 @@ class Classifier():
 
 if __name__ == "__main__":
 
-    pre_train = True
-    epoch = 40
-    bsz = 256
+    pre_train = False
+    epoch = 8
+    bsz = 1024
 
     print("Processing data...")
 
@@ -276,12 +281,12 @@ if __name__ == "__main__":
             pre_train_loss = 0
 
             for batch_ndx, sample in enumerate(tqdm(data_loader, leave=False)):
-                pre_train_loss += classifier.pretrain(sample)
+                pre_train_loss += classifier.pretrain(batch_ndx, sample, len(data_loader))
 
             print(f"Epoch loss (pre-training): {pre_train_loss / batch_ndx+1}")
-
-    epoch = 3
-    bsz = 32
+    
+    epoch = 8
+    bsz = 1024
 
     # k-fold cross validation
     # The model is trained and evaluated k times, each time using a different fold as the test set and the remaining folds as the training set.
@@ -317,4 +322,9 @@ if __name__ == "__main__":
             perc_correct.append(classifier.eval_classifier(sample))
 
         print(f"Percent Correct: {torch.mean(torch.tensor(perc_correct))}")
+
+    if pre_train:
+        classifier.save("pretrained.pt")
+    else:
+        classifier.save("model.pt")
 
