@@ -184,7 +184,7 @@ class Classifier():
         return projection
 
 
-    def pretrain(self, batch_ndx, x, max):
+    def pretrain_step(self, batch_ndx, x, max):
 
         base_X, _ = x
         base_X = base_X.to(device)
@@ -214,7 +214,7 @@ class Classifier():
         return loss.item()
 
 
-    def train_classifier(self, x):
+    def finetune_step(self, x):
         '''
         Train the model on one batch of data
         :param x: train data
@@ -240,7 +240,7 @@ class Classifier():
         return loss.item()
 
 
-    def eval_classifier(self, x):
+    def eval_step(self, x):
         X, y = x
         X, y = X.to(device), y.to(device)
         mask = torch.where(X != 0, torch.tensor(1), torch.tensor(0))
@@ -252,6 +252,32 @@ class Classifier():
         perc_correct = torch.nonzero(y_hat == y).shape[0] / y.shape[0]
 
         return perc_correct
+    
+    def pretrain(self, train_loader, epochs):
+        for j in tqdm(range(epochs)):
+            ep_loss = 0.0
+            for batch_ndx, sample in enumerate(tqdm(train_loader, leave=False)):
+                ep_loss += self.pretrain_step(batch_ndx, sample, len(train_loader))
+            
+            print(f"Epoch loss: {ep_loss / batch_ndx+1}")
+
+    
+    def finetune(self, train_loader, epochs):
+        for j in tqdm(range(epochs)):
+            ep_loss = 0.0
+            for batch_ndx, sample in enumerate(tqdm(train_loader, leave=False)):
+                ep_loss += self.finetune_step(sample)
+            
+            print(f"Epoch loss: {ep_loss / batch_ndx+1}")
+
+
+    def evaluate(self, test_loader):
+        perc_correct = []
+
+        for batch_ndx, sample in enumerate(tqdm(test_loader, leave=False)):
+            perc_correct.append(self.eval_step(sample))
+            
+        print(f"Percent Correct: {torch.mean(torch.tensor(perc_correct))}")
 
 
 if __name__ == "__main__":
@@ -276,14 +302,7 @@ if __name__ == "__main__":
     if pre_train:
 
         print("Pre-training...")
-
-        for i in tqdm(range(epoch)):
-            pre_train_loss = 0
-
-            for batch_ndx, sample in enumerate(tqdm(data_loader, leave=False)):
-                pre_train_loss += classifier.pretrain(batch_ndx, sample, len(data_loader))
-
-            print(f"Epoch loss (pre-training): {pre_train_loss / batch_ndx+1}")
+        classifier.pretrain(data_loader, epoch)
     
     epoch = 8
     bsz = 1024
@@ -304,24 +323,14 @@ if __name__ == "__main__":
         test_loader = DataLoader(test_fold, shuffle=False, batch_size=bsz)
 
         print("Training classifier...")
-
-        for i in tqdm(range(epoch)):
-            loss = 0
-
-            for batch_ndx, sample in enumerate(tqdm(train_loader, leave=False)):
-                loss += classifier.train_classifier(sample)
-
-            print(f"Epoch loss: {loss / batch_ndx+1}")
+        classifier.finetune(train_loader, epoch)
 
         classifier.model.eval()
         perc_correct = []
 
         print("Evaluate classification...")
 
-        for batch_ndx, sample in enumerate(tqdm(test_loader, leave=False)):
-            perc_correct.append(classifier.eval_classifier(sample))
-
-        print(f"Percent Correct: {torch.mean(torch.tensor(perc_correct))}")
+        classifier.evaluate(test_loader)
 
     if pre_train:
         classifier.save("pretrained.pt")
