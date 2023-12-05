@@ -106,10 +106,9 @@ class ContrastiveLoss(nn.Module):
    """
    Vanilla Contrastive loss, also called InfoNceLoss as in SimCLR paper
    """
-   def __init__(self, batch_size, temperature=0.5):
+   def __init__(self, temperature=0.5):
        super().__init__()
        self.temperature = temperature
-       self.batch_size = batch_size
 
 
    def calc_similarity_batch(self, a, b):
@@ -141,7 +140,7 @@ class ContrastiveLoss(nn.Module):
        denominator = device_as(mask, similarity_matrix) * torch.exp(similarity_matrix / self.temperature)
 
        all_losses = -torch.log(nominator / torch.sum(denominator, dim=1))
-       loss = torch.sum(all_losses) / (2 * self.batch_size)
+       loss = torch.sum(all_losses) / (2 * batch_size)
        return loss
 
 # END -- Contrastive learning
@@ -153,13 +152,13 @@ class Classifier():
         self.model = TCRModel()
         self.model.to(device)
 
-        self.pretrain_loss_func = ContrastiveLoss(batch_size=1024, temperature=0.2)
+        self.pretrain_loss_func = ContrastiveLoss(temperature=0.5)
         self.pretrain_optimizer = optim.SGD(self.model.parameters(), lr=1e-3)
 
         self.loss_func = clf_loss_func.to(device)
         self.optimizer = optim.AdamW(self.model.parameters(), lr=self.learning_rate)
 
-        self.accum_iter = 16  
+        self.accum_iter = 4  
 
 
     def save(self, filename):
@@ -194,7 +193,6 @@ class Classifier():
 
         proj_1_mask = torch.where(proj_1 != 0, torch.tensor(1), torch.tensor(0))
         proj_2_mask = torch.where(proj_2 != 0, torch.tensor(1), torch.tensor(0))
-
 
         proj_1_output = self.model(proj_1, proj_1_mask, classification=False)
         proj_2_output = self.model(proj_2, proj_2_mask, classification=False)
@@ -256,8 +254,8 @@ class Classifier():
 
 if __name__ == "__main__":
 
-    pre_train = False
-    epoch = 8
+    pre_train = True
+    epoch = 3
     bsz = 1024
 
     print("Processing data...")
@@ -285,7 +283,7 @@ if __name__ == "__main__":
 
             print(f"Epoch loss (pre-training): {pre_train_loss / batch_ndx+1}")
     
-    epoch = 8
+    epoch = 3
     bsz = 1024
 
     # k-fold cross validation
