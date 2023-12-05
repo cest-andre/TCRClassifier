@@ -1,3 +1,6 @@
+# Baseline model: https://drive.google.com/file/d/1Popb7jTjCuk4GITBDDWMQ1Kz0cQ2tbMJ/view?usp=drive_link
+# Pre-trained model: https://drive.google.com/file/d/1Gzj0H_UZw7j4lLHKSXbNPSkRvWGdRdT0/view?usp=drive_link
+
 import torch
 import torch.nn.functional as F
 from torch import nn, optim
